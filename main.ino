@@ -574,8 +574,7 @@ void setup() {
   Serial.println("|  |    '--. `\\    `.  `-. |  ||  |,--.'-.  .-'| .-. : ");
   Serial.println("'  '--'\.--'  /.--..-'    |'  ''  '|  |  |  |  \\   --. ");
   Serial.println(" `-----'`----' '--'`-----'  `----' `--'  `--'   `----' ");
-  Serial.println("                                                       ");
-  Serial.println("version 0.11.2");
+  Serial.println("version 0.11.2                        MADE BY Burn-png");
   Serial.println();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
