@@ -1,6 +1,6 @@
-# C5 Firmware
+# C5.Suite
 
-A lightweight firmware for the ESP32-C5 focused on passive Wi-Fi analysis and local network diagnostics through a serial command-line interface.
+A lightweight firmware for the Seeed Studio Xiao ESP32-C5 focused on passive Wi-Fi analysis and local network diagnostics through a serial command-line interface.
 
 Unlike touchscreen-based firmware, C5 Firmware is designed around a fast serial workflow, making it suitable for scripting, automation, and terminal-based operation.
 
@@ -209,7 +209,7 @@ Stops:
 
 Current target:
 
-- ESP32-C5
+- Seeed Studio Xiao ESP32C5
 
 ---
 
@@ -248,11 +248,7 @@ Planned additions include:
 - PMKID detection
 - SAE commit monitoring
 - Expanded AP capability parsing
-- Better vendor database
-- Packet export
-- Improved filtering
 - Additional diagnostic commands
-- Performance optimizations
 
 ---
 
