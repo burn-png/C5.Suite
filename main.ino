@@ -1,23 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-
 extern "C" {
   #include "esp_wifi.h"
   #include "ping/ping_sock.h"
 }
-
-// KEY FIXES:
-// 1. find_ie() - Proper Information Element parser starting at offset 36 (not 24)
-// 2. extract_ssid_from_beacon() - Uses find_ie() to correctly locate SSID IE type 0
-// 3. parse_wpa_ie(), parse_rsn_ie(), parse_wps_ie() - Use find_ie() for correct parsing
-// 4. Debug output in promisc_cb() - Shows all SSIDs found and when match occurs
-
 typedef void (*cmd_handler_t)(const char *args);
 static void cmd_help(const char *args), cmd_scan(const char *args);
 static void cmd_stop(const char *args), cmd_cancel(const char *args), cmd_wifi(const char *args);
 static void cmd_apinfo(const char *args);
-
 typedef enum { MODE_NONE, MODE_BEACON, MODE_PROBE, MODE_DEAUTH, MODE_EAPOL, MODE_ALL, MODE_APINFO } scan_mode_t;
 typedef struct { const char *name; scan_mode_t mode; } mode_entry_t;
 static const mode_entry_t monitor_modes[] = {
@@ -28,8 +19,6 @@ static const mode_entry_t monitor_modes[] = {
   { "all", MODE_ALL },
 };
 #define MONITOR_MODE_COUNT (sizeof(monitor_modes) / sizeof(monitor_modes[0]))
-
-// AP Info structure
 typedef struct {
   char ssid[33];
   uint8_t bssid[6];
@@ -62,7 +51,6 @@ typedef struct {
   bool is_wpa3;
   bool is_enterprise;
 } ap_info_t;
-
 static scan_mode_t current_mode = MODE_NONE;
 static uint32_t packet_count = 0, scan_duration_ms = 0, scan_start_time = 0;
 static bool scan_infinite = false;
@@ -71,30 +59,23 @@ static const uint8_t hop_channels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1
 static uint8_t hop_index = 0;
 static uint32_t last_hop_time = 0, hop_count = 0;
 #define HOP_INTERVAL_MS 150
-
-// AP Info scan state
 static ap_info_t found_ap = {0};
 static char target_ssid[33] = {0};
 static char apinfo_tag[32] = {0};
 static bool apinfo_found = false;
 static uint32_t apinfo_scan_timeout = 0;
-
-// Non-blocking Wi-Fi connect state
 static bool wifi_connecting = false;
 static uint32_t wifi_connect_start_time = 0;
 static uint32_t wifi_connect_timeout_ms = 20000;
 static char wifi_connecting_ssid[33] = {0};
-
 typedef struct __attribute__((packed)) {
   uint16_t frame_ctrl, duration;
   uint8_t addr1[6], addr2[6], addr3[6];
   uint16_t seq_ctrl;
 } wifi_hdr_t;
-
 static void mac_to_str(const uint8_t *mac, char *out) {
   sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
-
 static const char* lookup_oui(const uint8_t *mac) {
   if (mac[0] == 0x00 && mac[1] == 0x1A && mac[2] == 0x2B) return "Cisco";
   if (mac[0] == 0x00 && mac[1] == 0x0B && mac[2] == 0x85) return "3Com";
@@ -107,7 +88,6 @@ static const char* lookup_oui(const uint8_t *mac) {
   if (mac[0] == 0xF4 && mac[1] == 0xEC && mac[2] == 0x38) return "Samsung";
   return "Unknown";
 }
-
 static const char *mgmt_subtype_name(uint8_t subtype) {
   switch (subtype) {
     case 0x4: return "probe-req"; case 0x5: return "probe-resp";
@@ -116,18 +96,12 @@ static const char *mgmt_subtype_name(uint8_t subtype) {
     case 0xD: return "action"; default: return "mgmt-other";
   }
 }
-
-// ========== PROPER IE PARSER - THE FIX ==========
-// Beacons: 802.11 header (24) + timestamp (8) + beacon interval (2) + capabilities (2) = 36 bytes before IEs
 static bool find_ie(uint8_t ie_type, const uint8_t *payload, uint16_t len, uint8_t *out_data, uint16_t *out_len) {
   uint16_t ie_start = 36;
-  
   while (ie_start + 2 <= len) {
     uint8_t type = payload[ie_start];
     uint8_t ie_len = payload[ie_start + 1];
-    
     if (ie_start + 2 + ie_len > len) break;
-    
     if (type == ie_type) {
       if (out_data && out_len) {
         *out_len = ie_len;
@@ -135,16 +109,13 @@ static bool find_ie(uint8_t ie_type, const uint8_t *payload, uint16_t len, uint8
       }
       return true;
     }
-    
     ie_start += 2 + ie_len;
   }
   return false;
 }
-
 static void extract_ssid_from_beacon(const uint8_t *payload, uint16_t len, char *out, size_t out_len) {
   uint8_t ssid_data[33] = {0};
   uint16_t ssid_len = 0;
-  
   if (find_ie(0, payload, len, ssid_data, &ssid_len)) { // IE type 0 = SSID
     if (ssid_len == 0) {
       strncpy(out, "(hidden)", out_len);
@@ -157,11 +128,8 @@ static void extract_ssid_from_beacon(const uint8_t *payload, uint16_t len, char 
   }
   out[out_len - 1] = 0;
 }
-
-// ========== CAPTURE BUFFER ==========
 #define CAP_BUF_SIZE 128
 #define CAP_PAYLOAD_COPY 256
-
 typedef struct {
   uint32_t index;
   uint8_t  channel;
@@ -174,11 +142,9 @@ typedef struct {
   uint16_t payload_len;
   uint8_t  payload[CAP_PAYLOAD_COPY];
 } capture_entry_t;
-
 static capture_entry_t cap_buf[CAP_BUF_SIZE];
 static volatile uint16_t cap_head = 0, cap_tail = 0;
 static volatile uint32_t cap_dropped = 0;
-
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (current_mode == MODE_NONE) return;
   wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
@@ -187,7 +153,6 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   uint8_t frame_type = (hdr->frame_ctrl >> 2) & 3, subtype = (hdr->frame_ctrl >> 4) & 15;
   bool mgmt = frame_type == 0;
   bool is_eapol = false;
-
   if (frame_type == 2) {
     if (pkt->rx_ctrl.sig_len > 32) {
       uint8_t *p = pkt->payload + 24;
@@ -196,19 +161,13 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
       }
     }
   }
-  
-  // ========== APINFO MODE - SSID DETECTION WITH DEBUG ==========
   if (current_mode == MODE_APINFO) {
     if (mgmt && subtype == 0x8) { // beacon
       char ssid[33];
       extract_ssid_from_beacon(pkt->payload, pkt->rx_ctrl.sig_len, ssid, sizeof(ssid));
-      
-      // DEBUG: print all SSIDs found
       if (strcmp(ssid, "(no ssid found)") != 0) {
         Serial.printf("[DEBUG] Found SSID: '%s' ch%d %ddBm\n", ssid, pkt->rx_ctrl.channel, pkt->rx_ctrl.rssi);
       }
-      
-      // Check if it matches target
       if (!strcasecmp(ssid, target_ssid)) {
         Serial.printf("[MATCH] Found target SSID: '%s'\n", target_ssid);
         apinfo_found = true;
@@ -217,14 +176,10 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         found_ap.channel = pkt->rx_ctrl.channel;
         strncpy(found_ap.ssid, ssid, sizeof(found_ap.ssid) - 1);
         found_ap.hidden_ssid = (strlen(ssid) == 0 || !strcasecmp(ssid, "(hidden)"));
-        
-        // Parse security info
         parse_wpa_ie(pkt->payload, pkt->rx_ctrl.sig_len, &found_ap);
         parse_rsn_ie(pkt->payload, pkt->rx_ctrl.sig_len, &found_ap);
         parse_wps_ie(pkt->payload, pkt->rx_ctrl.sig_len, &found_ap);
-        
         strncpy(found_ap.vendor_oui, lookup_oui(hdr->addr2), sizeof(found_ap.vendor_oui) - 1);
-        
         if (!found_ap.is_wpa && !found_ap.is_wpa2 && !found_ap.is_wpa3) {
           found_ap.is_open = true;
           strncpy(found_ap.security, "Open", sizeof(found_ap.security) - 1);
@@ -233,15 +188,12 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
     return;
   }
-
   if (current_mode == MODE_BEACON && (!mgmt || subtype != 0x8)) return;
   if (current_mode == MODE_PROBE && (!mgmt || subtype != 0x4)) return;
   if (current_mode == MODE_DEAUTH && (!mgmt || (subtype != 0xA && subtype != 0xC))) return;
   if (current_mode == MODE_EAPOL && !is_eapol) return;
-
   uint16_t next_head = (cap_head + 1) % CAP_BUF_SIZE;
   if (next_head == cap_tail) { ++cap_dropped; return; }
-
   capture_entry_t *e = &cap_buf[cap_head];
   e->index = ++packet_count;
   e->channel = pkt->rx_ctrl.channel;
@@ -255,10 +207,8 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (copy_len > CAP_PAYLOAD_COPY) copy_len = CAP_PAYLOAD_COPY;
   memcpy(e->payload, pkt->payload, copy_len);
   e->payload_len = copy_len;
-
   cap_head = next_head;
 }
-
 static void drain_capture_buffer() {
   while (cap_tail != cap_head) {
     capture_entry_t *e = &cap_buf[cap_tail];
@@ -266,7 +216,6 @@ static void drain_capture_buffer() {
     char src[18], dst[18];
     mac_to_str(e->addr2, src);
     mac_to_str(e->addr1, dst);
-    
     if (e->eapol) {
       const char *type = "EAPOL";
       if (e->payload_len > 40) {
@@ -287,22 +236,17 @@ static void drain_capture_buffer() {
       const char *kind = mgmt ? mgmt_subtype_name(e->subtype) : (e->frame_type == 1 ? "control" : "data");
       Serial.printf("#%lu ch%d %ddBm [%s] src=%s dst=%s\n", (unsigned long)e->index, e->channel, e->rssi, kind, src, dst);
     }
-
     cap_tail = (cap_tail + 1) % CAP_BUF_SIZE;
   }
-
   static uint32_t last_dropped_report = 0;
   if (cap_dropped != last_dropped_report) {
     Serial.printf("[buffer overrun: %lu frames dropped total - traffic exceeded print rate]\n", (unsigned long)cap_dropped);
     last_dropped_report = cap_dropped;
   }
 }
-
-// ========== SECURITY PARSERS ==========
 static void parse_rsn_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
   uint8_t rsn_data[256] = {0};
   uint16_t rsn_len = 0;
-  
   if (find_ie(48, payload, len, rsn_data, &rsn_len)) {
     if (rsn_len >= 2) {
       ap->is_wpa2 = true;
@@ -315,7 +259,6 @@ static void parse_rsn_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
     }
   }
 }
-
 static void parse_wpa_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
   for (uint16_t i = 36; i + 6 < len; ++i) {
     if (payload[i] == 0xDD &&
@@ -327,7 +270,6 @@ static void parse_wpa_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
     }
   }
 }
-
 static void parse_wps_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
   for (uint16_t i = 36; i + 6 < len; ++i) {
     if (payload[i] == 0xDD && 
@@ -341,10 +283,8 @@ static void parse_wps_ie(const uint8_t *payload, uint16_t len, ap_info_t *ap) {
     }
   }
 }
-
 static void do_stop_scan() {
   bool did_something = false;
-
   if (current_mode != MODE_NONE) {
     esp_wifi_set_promiscuous(false);
     if (current_mode == MODE_APINFO) {
@@ -357,37 +297,30 @@ static void do_stop_scan() {
     scan_infinite = false;
     did_something = true;
   }
-
   if (wifi_connecting) {
     WiFi.disconnect(false, false);
     Serial.printf("Wi-Fi connection attempt to '%s' cancelled\n", wifi_connecting_ssid);
     wifi_connecting = false;
     did_something = true;
   }
-
   if (!did_something) Serial.println("nothing running");
 }
-
 static bool connected() { return WiFi.status() == WL_CONNECTED; }
-
 static bool parse_ip(const char *text, IPAddress &out) {
   if (!out.fromString(text)) { Serial.println("target must be an IPv4 address"); return false; }
   return true;
 }
-
 static bool is_local_target(const IPAddress &target) {
   IPAddress local = WiFi.localIP(), mask = WiFi.subnetMask();
   for (uint8_t i = 0; i < 4; ++i) if ((target[i] & mask[i]) != (local[i] & mask[i])) return false;
   return true;
 }
-
 static bool require_local_target(const char *text, IPAddress &target) {
   if (!connected()) { Serial.println("connect first: wifi <ssid> <password>"); return false; }
   if (!parse_ip(text, target)) return false;
   if (!is_local_target(target)) { Serial.println("for safety, connected-network checks are limited to this local subnet"); return false; }
   return true;
 }
-
 static void scan_ap_mode() {
   if (current_mode != MODE_NONE) { Serial.println("already scanning, use 'stop' first"); return; }
   if (connected()) { Serial.println("disconnect from Wi-Fi before scan ap; client mode must stay on its AP channel"); return; }
@@ -401,7 +334,6 @@ static void scan_ap_mode() {
   }
   Serial.println("AP discovery complete: all channels scanned three times");
 }
-
 static void run_tcp_probe(const char *label, const char *host_text, uint16_t port) {
   IPAddress host;
   if (!require_local_target(host_text, host)) return;
@@ -410,11 +342,9 @@ static void run_tcp_probe(const char *label, const char *host_text, uint16_t por
   Serial.printf("%s %s:%u %s\n", label, host.toString().c_str(), port, open ? "OPEN" : "closed or filtered");
   if (open) client.stop();
 }
-
 static volatile bool ping_done = false, ping_reply = false;
 static void ping_success(esp_ping_handle_t hdl, void *args) { ping_reply = true; }
 static void ping_end(esp_ping_handle_t hdl, void *args) { ping_done = true; }
-
 static void run_ping(const char *host_text) {
   IPAddress host;
   if (!require_local_target(host_text, host)) return;
@@ -443,7 +373,6 @@ static void run_ping(const char *host_text) {
   esp_ping_delete_session(handle);
   Serial.printf("PING %s %s\n", host.toString().c_str(), ping_reply ? "reachable" : "no reply");
 }
-
 static void run_arp_sweep(const char *start_text, const char *end_text) {
   if (!connected()) { Serial.println("connect first: wifi <ssid> <password>"); return; }
   int start = start_text && *start_text ? atoi(start_text) : 1;
@@ -461,7 +390,6 @@ static void run_arp_sweep(const char *start_text, const char *end_text) {
   }
   Serial.println("ARP probe complete. ESP32 Arduino does not expose its ARP cache portably, so only confirmed TCP/ICMP results are printed by the other scans.");
 }
-
 static void print_apinfo_section(ap_info_t *ap, const char *tag) {
   if (!strcasecmp(tag, "identity") || !strcasecmp(tag, "all")) {
     Serial.println("\n--- IDENTITY ---");
@@ -472,7 +400,6 @@ static void print_apinfo_section(ap_info_t *ap, const char *tag) {
     Serial.printf("BSSID: %s\n", bssid_str);
     Serial.printf("Vendor/OUI: %s\n", ap->vendor_oui);
   }
-
   if (!strcasecmp(tag, "security") || !strcasecmp(tag, "all")) {
     Serial.println("\n--- SECURITY ---");
     Serial.printf("Security Type: %s\n", ap->security);
@@ -487,7 +414,6 @@ static void print_apinfo_section(ap_info_t *ap, const char *tag) {
       Serial.printf("WPS Device Name: %s\n", ap->wps_device_name);
     }
   }
-
   if (!strcasecmp(tag, "radio") || !strcasecmp(tag, "all")) {
     Serial.println("\n--- RADIO ---");
     Serial.printf("Band: %s\n", ap->channel <= 14 ? "2.4 GHz" : "5 GHz");
@@ -496,7 +422,6 @@ static void print_apinfo_section(ap_info_t *ap, const char *tag) {
     Serial.printf("802.11 Mode: %s\n", ap->mode);
     Serial.printf("RSSI: %d dBm\n", ap->rssi);
   }
-
   if (!strcasecmp(tag, "capability") || !strcasecmp(tag, "all")) {
     Serial.println("\n--- CAPABILITY ---");
     Serial.printf("Wi-Fi 6 (802.11ax): %s\n", ap->wifi6_supported ? "Yes" : "No");
@@ -505,34 +430,26 @@ static void print_apinfo_section(ap_info_t *ap, const char *tag) {
     Serial.printf("Vendor IEs: %s\n", ap->vendor_ie);
   }
 }
-
 static void cmd_apinfo(const char *args) {
   if (current_mode != MODE_NONE) { Serial.println("already scanning, use 'stop' first"); return; }
   if (connected()) { Serial.println("disconnect from Wi-Fi before apinfo scan; channel hopping interrupts the connection"); return; }
-
   char buf[96];
   strncpy(buf, args, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = 0;
-
   char *ssid = strtok(buf, " ");
   char *tag = strtok(NULL, " ");
-
   if (!ssid) {
     Serial.println("usage: apinfo <ssid> <tag>");
     Serial.println("tags: identity, security, radio, capability, all");
     return;
   }
-
   if (!tag) tag = "all";
-
   strncpy(target_ssid, ssid, sizeof(target_ssid) - 1);
   target_ssid[sizeof(target_ssid) - 1] = 0;
   strncpy(apinfo_tag, tag, sizeof(apinfo_tag) - 1);
   apinfo_tag[sizeof(apinfo_tag) - 1] = 0;
-
   memset(&found_ap, 0, sizeof(found_ap));
   apinfo_found = false;
-
   current_mode = MODE_APINFO;
   packet_count = hop_count = 0;
   scan_start_time = last_hop_time = millis();
@@ -544,7 +461,6 @@ static void cmd_apinfo(const char *args) {
 
   Serial.printf("apinfo scan started for SSID '%s' (15s timeout, or 'stop' to abort)\n", ssid);
 }
-
 static void cmd_scan(const char *args) {
   char buf[96];
   strncpy(buf, args, sizeof(buf) - 1);
@@ -584,55 +500,44 @@ static void cmd_scan(const char *args) {
   esp_wifi_set_promiscuous(true);
   Serial.printf("monitor scan '%s' started%s\n", mode, scan_duration_ms ? " (timed)" : scan_infinite ? " (until stop)" : " (one channel cycle)");
 }
-
 static void cmd_wifi(const char *args) {
   if (current_mode != MODE_NONE) do_stop_scan();
-
   char buf[130];
   strncpy(buf, args, sizeof(buf)-1);
   buf[sizeof(buf)-1]=0;
   char *ssid = strtok(buf, " "), *password = strtok(NULL, " "), *timeout_arg = strtok(NULL, " ");
-
   if (ssid && !strcasecmp(ssid, "disconnect") && !password) {
     if (wifi_connecting) { wifi_connecting = false; }
     WiFi.disconnect(false, false);
     Serial.println("Wi-Fi disconnected");
     return;
   }
-
   if (!ssid || !password) {
     Serial.println("usage: wifi <ssid> <password> [timeout_seconds]  (SSID/password cannot contain spaces)");
     return;
   }
-
   if (wifi_connecting) {
     Serial.println("already attempting a connection, use 'cancel' or 'stop' first");
     return;
   }
-
   uint32_t timeout_ms = 20000;
   if (timeout_arg) {
     long secs = atol(timeout_arg);
     if (secs <= 0) { Serial.println("timeout_seconds must be a positive number"); return; }
     timeout_ms = (uint32_t)secs * 1000UL;
   }
-
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
   WiFi.begin(ssid, password);
-
   strncpy(wifi_connecting_ssid, ssid, sizeof(wifi_connecting_ssid) - 1);
   wifi_connecting_ssid[sizeof(wifi_connecting_ssid) - 1] = '\0';
   wifi_connecting = true;
   wifi_connect_start_time = millis();
   wifi_connect_timeout_ms = timeout_ms;
-
   Serial.printf("connecting to %s (timeout %lus, 'cancel'/'stop' to abort)\n", ssid, (unsigned long)(timeout_ms / 1000));
 }
-
 static void cmd_stop(const char *args) { do_stop_scan(); }
 static void cmd_cancel(const char *args) { do_stop_scan(); }
-
 static void cmd_help(const char *args) {
   Serial.println("available commands:");
   Serial.println("  scan ap                         - passive AP discovery; exactly three full scans, no duration");
@@ -647,10 +552,8 @@ static void cmd_help(const char *args) {
   Serial.println("  scan port <ip> <port>           - one TCP port check");
   Serial.println("  scan ssh|telnet|smtp|dns|http|https|rdp <ip> - TCP service-port check");
 }
-
 typedef struct { const char *name; cmd_handler_t handler; } cmd_entry_t;
 static const cmd_entry_t commands[] = { {"scan",cmd_scan}, {"apinfo",cmd_apinfo}, {"wifi",cmd_wifi}, {"stop",cmd_stop}, {"cancel",cmd_cancel}, {"help",cmd_help} };
-
 static void dispatch_line(char *line) {
   while (*line == ' ') ++line;
   if (!*line) return;
@@ -660,14 +563,20 @@ static void dispatch_line(char *line) {
     if (!strcasecmp(line, commands[i].name)) { commands[i].handler(args); return; }
   Serial.printf("unknown command: '%s' (try help)\n", line);
 }
-
 #define RX_BUF_SIZE 256
 static char line_buf[RX_BUF_SIZE];
 static size_t line_idx = 0;
-
 void setup() {
   Serial.begin(921600);
   delay(500);
+  Serial.println(" ,-----.,-----.     ,---.          ,--.  ,--.          ");
+  Serial.println("'  .--./|  .--'    '   .-' ,--.,--.`--',-'  '-. ,---.  ");
+  Serial.println("|  |    '--. `\\    `.  `-. |  ||  |,--.'-.  .-'| .-. : ");
+  Serial.println("'  '--'\.--'  /.--..-'    |'  ''  '|  |  |  |  \\   --. ");
+  Serial.println(" `-----'`----' '--'`-----'  `----' `--'  `--'   `----' ");
+  Serial.println("                                                       ");
+  Serial.println("version 0.11.2");
+  Serial.println();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
   wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL };
@@ -675,7 +584,6 @@ void setup() {
   esp_wifi_set_promiscuous_rx_cb(&promisc_cb);
   Serial.println("ESP32 passive monitor / local diagnostics ready; type help");
 }
-
 void loop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -689,10 +597,7 @@ void loop() {
     else if (line_idx < RX_BUF_SIZE - 1) line_buf[line_idx++] = c;
     else { line_idx = 0; Serial.println("line too long, dropped"); }
   }
-
   drain_capture_buffer();
-
-  // Non-blocking Wi-Fi connect polling
   if (wifi_connecting) {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("connected: ip=%s gateway=%s mask=%s\n",
@@ -704,8 +609,6 @@ void loop() {
       wifi_connecting = false;
     }
   }
-
-  // apinfo mode handling
   if (current_mode == MODE_APINFO) {
     uint32_t now = millis();
     if (now >= apinfo_scan_timeout) {
@@ -718,8 +621,6 @@ void loop() {
       do_stop_scan();
       return;
     }
-
-    // Channel hopping for apinfo
     if (now - last_hop_time < HOP_INTERVAL_MS) return;
     hop_index = (hop_index + 1) % HOP_CHANNEL_COUNT;
     ++hop_count;
@@ -727,7 +628,6 @@ void loop() {
     last_hop_time = now;
     return;
   }
-
   if (current_mode == MODE_NONE) return;
   uint32_t now = millis();
   if (scan_duration_ms && now - scan_start_time >= scan_duration_ms) { Serial.println("scan duration elapsed"); do_stop_scan(); return; }
